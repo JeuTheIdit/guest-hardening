@@ -243,8 +243,25 @@ log_ok "Login banners applied."
 # 10. NTP / Time Sync
 # -------------------------------
 log_info "Ensuring time synchronization..."
+
+# Enable chrony
 systemctl enable --now chronyd
 timedatectl set-ntp true
+
+# Backup default chrony config
+CHRONY_CONF="/etc/chrony/chrony.conf"
+if [ ! -f "${CHRONY_CONF}.bak" ]; then
+    cp "$CHRONY_CONF" "${CHRONY_CONF}.bak"
+fi
+
+# Replace NTP servers with only 192.168.200.2
+sed -i '/^pool /d' "$CHRONY_CONF"
+sed -i '/^server /d' "$CHRONY_CONF"
+echo "server 192.168.200.2 iburst" >> "$CHRONY_CONF"
+
+# Restart chrony to apply
+systemctl restart chronyd
+chronyc sources -v
 log_ok "Time synchronization configured."
 
 # -------------------------------
