@@ -2,33 +2,43 @@
 
 set -e
 
+# Color codes
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+# Logging functions
+msg_info()    { echo -e "${YELLOW}INFO:${NC} $1"; }
+msg_ok() { echo -e "${GREEN}SUCCESS:${NC} $1"; }
+msg_error()   { echo -e "${RED}ERROR:${NC} $1"; }
+
 # Ensure the script is run as root
 if [ "$EUID" -ne 0 ]; then
-    echo "Please run as root"
+    msg_error "Please run as root"
     exit 1
 fi
 
-echo "Starting Debian 12 hardening process..."
+msg_info "Starting Debian 12 hardening process..."
 
 # Logging setup
 LOGFILE="/var/log/debian_hardening.log"
 exec > >(tee -a "$LOGFILE") 2>&1
 
 # Update and upgrade system packages
-echo "Updating and upgrading system..."
+msg_info "Updating and upgrading system..."
 apt update && apt upgrade -y
 
 # Install essential security tools
-echo "Installing essential security tools..."
-apt install -y ufw fail2ban unattended-upgrades auditd lynis apparmor apparmor-profiles apparmor-utils
+msg_info "Installing essential security tools..."
+apt install -y ufw fail2ban unattended-upgrades auditd audispd-plugins lynis apparmor apparmor-profiles apparmor-utils
 
 # Configure automatic security updates
-echo "Configuring unattended upgrades..."
-echo unattended-upgrades unattended-upgrades/enable_auto_updates boolean true | debconf-set-selections
-DEBIAN_FRONTEND=noninteractive apt install -y unattended-upgrades
+msg_info "Configuring unattended upgrades..."
+systemctl enable --now unattended-upgrades
 
 # Configure UFW firewall
-echo "Configuring UFW firewall..."
+msg_info "Configuring UFW firewall..."
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow 80/tcp
@@ -76,6 +86,8 @@ if [ "$skip_ssh_hardening" != true ]; then
     update_ssh_config "PasswordAuthentication" "no"
     update_ssh_config "X11Forwarding" "no"
     update_ssh_config "MaxAuthTries" "3"
+    update_ssh_config "StrictModes" "yes"
+    update_ssh_config "AllowUsers" "jnbolsen"
     systemctl restart sshd
 else
     echo "SSH hardening skipped to avoid lockout."
@@ -106,6 +118,9 @@ if [ -f /etc/fail2ban/jail.local ]; then
 fi
 
 cat <<EOT > /etc/fail2ban/jail.local
+[DEFAULT]
+bantime = 8h
+
 [sshd]
 enabled = true
 port = 22
@@ -115,84 +130,137 @@ maxretry = 3
 bantime = 3600
 EOT
 chmod 600 /etc/fail2ban/jail.local
-systemctl enable fail2ban --now
+systemctl enable --now fail2ban
 
 # Enable auditd
 echo "Enabling auditd..."
-systemctl enable auditd
-systemctl start auditd
+systemctl enable --now auditd
 
-# Disable unneeded services
-echo "Disabling unnecessary services..."
-systemctl stop avahi-daemon cups
-systemctl disable avahi-daemon cups
+# Function to remove services and packages
+remove_service_and_package() {
+    local svc="$1"
+    local pkg="$2"
+
+    if systemctl list-unit-files | grep -q "^${svc}"; then
+        msg_info "Disabling and stopping ${svc}"
+        systemctl disable --now "${svc}" &>/dev/null
+    fi
+
+    if dpkg -s "${pkg}" &>/dev/null; then
+        msg_info "Removing package ${pkg}"
+        apt purge -y "${pkg}"
+    else
+        msg_info "Package ${pkg} not installed, skipping"
+    fi
+}
+
+# Remove Avahi
+remove_service_and_package "avahi-daemon.service" "avahi-daemon"
+
+# Remove CUPS (printing system)
+remove_service_and_package "cups.service" "cups"
+
+# Remove ModemManager (mobile broadband daemon)
+remove_service_and_package "ModemManager.service" "modemmanager"
+
+# Remove Snap only if no essential snaps are installed
+if snap list &>/dev/null && [ "$(snap list | wc -l)" -le 1 ]; then
+    remove_service_and_package "snapd.service" "snapd" "Snap (snapd service)"
+else
+    msg_info "Snap packages detected, skipping removal to avoid breaking snaps"
+fi
+
+# Cleanup unused dependencies
+msg_info "Running apt autoremove"
+apt autoremove -y
 
 # Optional: disable Bluetooth
 # systemctl disable bluetooth
 
 # Harden kernel parameters
-echo "Applying sysctl kernel hardening..."
+msg_info "Applying sysctl kernel hardening..."
 cat <<EOT > /etc/sysctl.d/99-hardening.conf
+# Disable IP forwarding
 net.ipv4.ip_forward = 0
+net.ipv6.conf.all.forwarding = 0
+net.ipv6.conf.default.forwarding = 0
+
+# ICMP redirects
 net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+
+# Source routing
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
+
+# TCP SYN flood protection
 net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_timestamps = 0
+
+# Address Space Layout Randomization (ASLR)
 kernel.randomize_va_space = 2
+
+# Reverse path filtering (anti-spoofing)
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+
+# Log suspicious/misrouted packets (martians)
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.log_martians = 1
+
+# ICMP broadcast protection (smurf attacks)
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+
+# Disable TCP timestamps to reduce fingerprinting
+net.ipv4.tcp_timestamps = 0
 EOT
 chmod 600 /etc/sysctl.d/99-hardening.conf
 sysctl --system
 
-# Secure home directory permissions
-echo "Securing /home directories..."
-chmod 750 /home/* 2>/dev/null || true
+# Function to add a mount to fstab if not already present
+add_mount() {
+    local line="$1"
+    local mount_point
+    mount_point=$(echo "$line" | awk '{print $2}')
+    
+    if grep -q "[[:space:]]$mount_point[[:space:]]" "$FSTAB"; then
+        echo "Mount for $mount_point already exists in fstab. Skipping..."
+    else
+        echo "$line" >> "$FSTAB"
+        echo "Added mount for $mount_point"
+    fi
+}
 
-# Mount /tmp with noexec,nosuid,nodev
-echo "Securing /tmp..."
-cat <<EOT > /etc/systemd/system/tmp.mount
-[Unit]
-Description=Temporary Directory
-Before=local-fs.target
-
-[Mount]
-What=tmpfs
-Where=/tmp
-Type=tmpfs
-Options=mode=1777,strictatime,noexec,nosuid,nodev
-
-[Install]
-WantedBy=local-fs.target
-EOT
-systemctl daemon-reexec
-systemctl enable tmp.mount
-systemctl start tmp.mount
+# Add noexec, nosuid, and nodev to /tmp, /var/tmp, and /dev/shm mounts
+add_mount "tmpfs /tmp tmpfs defaults,noexec,nosuid,nodev 0 0"
+add_mount "tmpfs /var/tmp tmpfs defaults,noexec,nosuid,nodev 0 0"
+add_mount "tmpfs /dev/shm tmpfs defaults,noexec,nosuid,nodev 0 0"
+mount -a
 
 # Enable AppArmor
-echo "Enabling AppArmor..."
-systemctl enable apparmor
-systemctl start apparmor
+msg_info "Enabling AppArmor..."
+systemctl enable --now apparmor
 
 # Set MOTD warning banner
-echo "Setting login warning banner..."
+msg_info "Setting login warning banner..."
 cat <<EOT > /etc/motd
 ** WARNING **
 This system is for authorized users only. All activity is monitored and logged.
 EOT
 
 # Basic security audit
-echo "Running security audit with Lynis..."
+msg_info "Running security audit with Lynis..."
 lynis audit system
 
 # Optional manual checks
-echo "Checking for world-writable files..."
+msg_info "Checking for world-writable files..."
 find / -xdev -type f -perm -0002 -print 2>/dev/null
 
-echo "Checking for SUID files..."
+msg_info "Checking for SUID files..."
 find / -xdev -type f -perm -4000 -print 2>/dev/null
 
-echo ""
-echo "Debian 12 hardening complete. See log: $LOGFILE"
+msg_info ""
+msg_ok "Debian 12 hardening complete. See log: $LOGFILE"
