@@ -3,7 +3,7 @@ These scripts are designed to harden Debian-based systems by applying various se
 - Debian (12 and 13)
 - Ubuntu (22.04, 24.04, and 25.10)
 
-### Key Features of This Script:
+## Key Features
 
 - Updates the system and ensures it's running the latest packages.
 - Configures ufw to manage firewall rules.
